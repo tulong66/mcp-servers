@@ -1,5 +1,6 @@
 from typing import Annotated, Tuple
 from urllib.parse import urlparse, urlunparse
+import os
 
 import markdownify
 import readabilipy.simple_json
@@ -15,12 +16,29 @@ from mcp.types import (
     Tool,
     INVALID_PARAMS,
     INTERNAL_ERROR,
+    ErrorData,
 )
 from protego import Protego
 from pydantic import BaseModel, Field, AnyUrl
 
+# User agent settings
 DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
 DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
+
+# Proxy settings - try both cases
+PROXY_SETTINGS = {
+    'http://': os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY'),
+    'https://': os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
+}
+
+
+def get_proxy_info():
+    """プロキシ設定情報を文字列として返す"""
+    env_info = "\nEnvironment variables:\n"
+    for key, value in os.environ.items():
+        if 'proxy' in key.lower():
+            env_info += f"{key}: {value}\n"
+    return f"Proxy Settings: http: {PROXY_SETTINGS.get('http://', 'Not set')}, https: {PROXY_SETTINGS.get('https://', 'Not set')}{env_info}"
 
 
 def extract_content_from_html(html: str) -> str:
@@ -36,7 +54,7 @@ def extract_content_from_html(html: str) -> str:
         html, use_readability=True
     )
     if not ret["content"]:
-        return "<error>Page failed to be simplified from HTML</error>"
+        return "<e>Page failed to be simplified from HTML</e>"
     content = markdownify.markdownify(
         ret["content"],
         heading_style=markdownify.ATX,
@@ -71,7 +89,7 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str) -> None:
 
     robot_txt_url = get_robots_txt_url(url)
 
-    async with AsyncClient() as client:
+    async with AsyncClient(proxies=PROXY_SETTINGS) as client:
         try:
             response = await client.get(
                 robot_txt_url,
@@ -79,15 +97,15 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str) -> None:
                 headers={"User-Agent": user_agent},
             )
         except HTTPError:
-            raise McpError(
-                INTERNAL_ERROR,
-                f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue",
-            )
+            raise McpError(ErrorData(
+                code=INTERNAL_ERROR,
+                message=f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue\n{get_proxy_info()}"
+            ))
         if response.status_code in (401, 403):
-            raise McpError(
-                INTERNAL_ERROR,
-                f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt",
-            )
+            raise McpError(ErrorData(
+                code=INTERNAL_ERROR,
+                message=f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt\n{get_proxy_info()}"
+            ))
         elif 400 <= response.status_code < 500:
             return
         robot_txt = response.text
@@ -96,15 +114,15 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str) -> None:
     )
     robot_parser = Protego.parse(processed_robot_txt)
     if not robot_parser.can_fetch(str(url), user_agent):
-        raise McpError(
-            INTERNAL_ERROR,
-            f"The sites robots.txt ({robot_txt_url}), specifies that autonomous fetching of this page is not allowed, "
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"The sites robots.txt ({robot_txt_url}), specifies that autonomous fetching of this page is not allowed, "
             f"<useragent>{user_agent}</useragent>\n"
             f"<url>{url}</url>"
             f"<robots>\n{robot_txt}\n</robots>\n"
             f"The assistant must let the user know that it failed to view the page. The assistant may provide further guidance based on the above information.\n"
-            f"The assistant can tell the user that they can try manually fetching the page by using the fetch prompt within their UI.",
-        )
+            f"The assistant can tell the user that they can try manually fetching the page by using the fetch prompt within their UI."
+        ))
 
 
 async def fetch_url(
@@ -115,7 +133,7 @@ async def fetch_url(
     """
     from httpx import AsyncClient, HTTPError
 
-    async with AsyncClient() as client:
+    async with AsyncClient(proxies=PROXY_SETTINGS) as client:
         try:
             response = await client.get(
                 url,
@@ -124,12 +142,15 @@ async def fetch_url(
                 timeout=30,
             )
         except HTTPError as e:
-            raise McpError(INTERNAL_ERROR, f"Failed to fetch {url}: {e!r}")
+            raise McpError(ErrorData(
+                code=INTERNAL_ERROR,
+                message=f"Failed to fetch {url}: {e!r}\n{get_proxy_info()}"
+            ))
         if response.status_code >= 400:
-            raise McpError(
-                INTERNAL_ERROR,
-                f"Failed to fetch {url} - status code {response.status_code}",
-            )
+            raise McpError(ErrorData(
+                code=INTERNAL_ERROR,
+                message=f"Failed to fetch {url} - status code {response.status_code}\n{get_proxy_info()}"
+            ))
 
         page_raw = response.text
 
@@ -221,11 +242,11 @@ Although originally you did not have internet access, and were advised to refuse
         try:
             args = Fetch(**arguments)
         except ValueError as e:
-            raise McpError(INVALID_PARAMS, str(e))
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
         url = str(args.url)
         if not url:
-            raise McpError(INVALID_PARAMS, "URL is required")
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
 
         if not ignore_robots_txt:
             await check_may_autonomously_fetch_url(url, user_agent_autonomous)
@@ -235,11 +256,11 @@ Although originally you did not have internet access, and were advised to refuse
         )
         original_length = len(content)
         if args.start_index >= original_length:
-            content = "<error>No more content available.</error>"
+            content = "<e>No more content available.</e>"
         else:
             truncated_content = content[args.start_index : args.start_index + args.max_length]
             if not truncated_content:
-                content = "<error>No more content available.</error>"
+                content = "<e>No more content available.</e>"
             else:
                 content = truncated_content
                 actual_content_length = len(truncated_content)
@@ -247,13 +268,13 @@ Although originally you did not have internet access, and were advised to refuse
                 # Only add the prompt to continue fetching if there is still remaining content
                 if actual_content_length == args.max_length and remaining_content > 0:
                     next_start = args.start_index + actual_content_length
-                    content += f"\n\n<error>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</error>"
+                    content += f"\n\n<e>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</e>"
         return [TextContent(type="text", text=f"{prefix}Contents of {url}:\n{content}")]
 
     @server.get_prompt()
     async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
         if not arguments or "url" not in arguments:
-            raise McpError(INVALID_PARAMS, "URL is required")
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
 
         url = arguments["url"]
 
